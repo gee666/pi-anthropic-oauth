@@ -54,6 +54,24 @@ export function convertPiMessagesToAnthropic(
   isOAuth: boolean,
 ): MessageParam[] {
   const params: MessageParam[] = [];
+  const toolIdMap = new Map<string, string>();
+  const usedToolIds = new Set<string>();
+
+  const getAnthropicToolId = (id: string): string => {
+    const existing = toolIdMap.get(id);
+    if (existing) return existing;
+
+    let base = sanitizeSurrogates(id).replace(/[^a-zA-Z0-9_-]/g, "_");
+    if (!base) base = "tool";
+    let candidate = base;
+    let suffix = 1;
+    while (usedToolIds.has(candidate)) {
+      candidate = `${base}_${suffix++}`;
+    }
+    usedToolIds.add(candidate);
+    toolIdMap.set(id, candidate);
+    return candidate;
+  };
 
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
@@ -93,7 +111,7 @@ export function convertPiMessagesToAnthropic(
         } else if (block.type === "toolCall") {
           blocks.push({
             type: "tool_use",
-            id: block.id,
+            id: getAnthropicToolId(block.id),
             name: isOAuth ? toClaudeCodeToolName(block.name) : block.name,
             input: block.arguments,
           });
@@ -107,7 +125,7 @@ export function convertPiMessagesToAnthropic(
       const toolResults = [
         {
           type: "tool_result" as const,
-          tool_use_id: message.toolCallId,
+          tool_use_id: getAnthropicToolId(message.toolCallId),
           content: convertToolResultContentToAnthropic(message.content),
           is_error: message.isError,
         },
@@ -118,7 +136,7 @@ export function convertPiMessagesToAnthropic(
         const nextMessage = messages[j] as ToolResultMessage;
         toolResults.push({
           type: "tool_result" as const,
-          tool_use_id: nextMessage.toolCallId,
+          tool_use_id: getAnthropicToolId(nextMessage.toolCallId),
           content: convertToolResultContentToAnthropic(nextMessage.content),
           is_error: nextMessage.isError,
         });
