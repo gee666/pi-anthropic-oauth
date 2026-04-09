@@ -29,6 +29,7 @@ Claude Pro/Max
 
 - sends Claude Code-like OAuth headers
 - rewrites Pi system identity where needed
+- auto-creates `~/.Claude Code` → `~/.pi` symlink
 
 ## License
 
