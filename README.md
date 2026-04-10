@@ -6,6 +6,7 @@ Claude Pro/Max OAuth extension for Pi.
 
 > [!WARNING]
 > Use this at your own risk. This may go against Anthropic's terms.
+> I do not recommend using this with gsd2 or any extensions that will cause heavy token usage.
 
 ## Install
 
