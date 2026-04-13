@@ -11,7 +11,7 @@ Claude Pro/Max OAuth extension for Pi.
 ## Install
 
 ```bash
-pi install npm:pi-anthropic-oauth
+pi install npm:oira666_pi-anthropic-oauth
 ```
 
 Start Pi, then run:

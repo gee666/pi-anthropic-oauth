@@ -1,6 +1,6 @@
 {
-  "name": "pi-anthropic-oauth",
-  "version": "0.1.5",
+  "name": "oira666_pi-anthropic-oauth",
+  "version": "0.1.6",
   "description": "Claude Pro/Max OAuth extension for Pi",
   "type": "module",
   "license": "MIT",
@@ -14,12 +14,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/leohenon/pi-anthropic-oauth"
+    "url": "https://github.com/gee666/pi-anthropic-oauth"
   },
   "bugs": {
-    "url": "https://github.com/leohenon/pi-anthropic-oauth/issues"
+    "url": "https://github.com/gee666/pi-anthropic-oauth/issues"
   },
-  "homepage": "https://github.com/leohenon/pi-anthropic-oauth#readme",
+  "homepage": "https://github.com/gee666/pi-anthropic-oauth#readme",
   "publishConfig": {
     "access": "public"
   },
