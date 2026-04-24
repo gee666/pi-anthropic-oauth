@@ -30,7 +30,7 @@ Claude Pro/Max
 
 - sends Claude Code-like OAuth headers
 - rewrites Pi system identity where needed
-- auto-creates `~/.Claude Code` → `~/.pi` symlink
+- on 429 rate limits errors waits for 30 mintues and retries in a loop
 
 ## License
 
