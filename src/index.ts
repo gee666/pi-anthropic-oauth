@@ -4,6 +4,7 @@ import {
   getApiProvider,
   type Api,
   type AssistantMessage,
+  type AssistantMessageEvent,
   type AssistantMessageEventStream,
   type Context,
   type Model,
@@ -137,18 +138,11 @@ function freshMessage(model: Model<Api>): AssistantMessage {
 }
 
 /**
- * Wraps a streamSimple with an indefinite 429-retry loop.
+ * Wrap a streamSimple with an indefinite 429 retry loop.
  *
- * Key design decisions:
- * - We own the output message object (never forwarded from the inner stream).
- *   This means Pi's history entry is always clean — no stopReason:"error"
- *   from a failed attempt bleeds through.
- * - The "start" event is emitted exactly once, before the first non-429
- *   content event arrives.  Failed attempts are completely invisible to Pi.
- * - While waiting we hold the stream open and show a countdown in Pi's
- *   status bar.  Pi never sees an error so its own retry logic never fires.
- * - Only HTTP 429 responses trigger the retry.  All other errors propagate
- *   immediately exactly as the built-in stream would.
+ * Important: we forward the built-in provider's events unchanged once an
+ * attempt is known to be non-429. That preserves tool-call streaming exactly.
+ * Potential 429 attempts are buffered and discarded, so Pi never sees them.
  */
 function streamWithRateLimitRetry(
   delegate: StreamSimpleFn,
@@ -157,60 +151,56 @@ function streamWithRateLimitRetry(
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const output = createAssistantMessageEventStream();
-  const msg = freshMessage(model); // single message object for the lifetime of this call
 
   void (async () => {
-    let startEmitted = false;
+    let committed = false;
 
-    const emitStart = () => {
-      if (!startEmitted) {
-        output.push({ type: "start", partial: msg });
-        startEmitted = true;
-      }
+    const flush = (buffer: AssistantMessageEvent[]) => {
+      for (const event of buffer) output.push(event);
+      committed = true;
     };
 
     while (true) {
       const inner = delegate(model, context, options);
-
+      const buffer: AssistantMessageEvent[] = [];
       let got429 = false;
 
       try {
         for await (const event of inner) {
-          switch (event.type) {
-            case "start":
-              // Never forward the inner start — we manage our own msg object.
-              // We'll emit our own start just before the first real content.
-              break;
-
-            case "error": {
-              const errMsg: string =
-                (event.error as { errorMessage?: string })?.errorMessage ?? "";
+          if (!committed) {
+            if (event.type === "error") {
+              const errMsg = event.error.errorMessage ?? "";
               if (is429(errMsg) && !options?.signal?.aborted) {
                 got429 = true;
-                break; // break the for-await, fall through to wait logic
+                break;
               }
-              // Real error — emit start if not yet done, then the error.
-              emitStart();
-              msg.stopReason = options?.signal?.aborted ? "aborted" : "error";
-              msg.errorMessage = errMsg;
-              output.push({ type: "error", reason: msg.stopReason as "error" | "aborted", error: msg });
+              // Non-429 error: flush buffered start (if any), then forward error.
+              flush(buffer);
+              output.push(event);
               output.end();
               return;
             }
 
-            case "done":
-              emitStart();
-              output.push({ type: "done", reason: event.reason, message: msg });
+            if (event.type === "start") {
+              buffer.push(event);
+              continue;
+            }
+
+            // First non-start, non-error event means this attempt is real.
+            flush(buffer);
+            output.push(event);
+            if (event.type === "done") {
               output.end();
               return;
+            }
+            continue;
+          }
 
-            default:
-              // All content events (text_start, text_delta, text_end,
-              // thinking_*, toolcall_*, message_delta, etc.) — emit start
-              // first if needed, then forward verbatim.
-              emitStart();
-              output.push(event);
-              break;
+          // Once committed, forward everything unchanged.
+          output.push(event);
+          if (event.type === "done" || event.type === "error") {
+            output.end();
+            return;
           }
         }
       } catch (err) {
@@ -218,33 +208,47 @@ function streamWithRateLimitRetry(
         if (is429(errMsg) && !options?.signal?.aborted) {
           got429 = true;
         } else {
-          emitStart();
-          msg.stopReason = options?.signal?.aborted ? "aborted" : "error";
-          msg.errorMessage = errMsg;
-          output.push({ type: "error", reason: msg.stopReason as "error" | "aborted", error: msg });
+          if (!committed) {
+            // Synthetic start+error so the stream protocol stays valid.
+            output.push({ type: "start", partial: freshMessage(model) });
+            committed = true;
+          }
+          const error = freshMessage(model);
+          error.stopReason = options?.signal?.aborted ? "aborted" : "error";
+          error.errorMessage = errMsg;
+          output.push({
+            type: "error",
+            reason: error.stopReason as "error" | "aborted",
+            error,
+          });
           output.end();
           return;
         }
       }
 
       if (!got429) {
-        // Stream ended without a done or error event — shouldn't happen.
+        // If a successful attempt ended with only start+done, flush buffered events.
+        if (!committed && buffer.length > 0) {
+          flush(buffer);
+        }
         output.end();
         return;
       }
 
-      // ── 429: hold the stream open, show countdown, then retry ────────────
       const waitResult = await waitForRateLimit(RATE_LIMIT_WAIT_MS, options?.signal);
-
       if (waitResult === "aborted") {
-        emitStart();
-        msg.stopReason = "aborted";
-        msg.errorMessage = "Request aborted during rate-limit wait.";
-        output.push({ type: "error", reason: "aborted", error: msg });
+        if (!committed) {
+          output.push({ type: "start", partial: freshMessage(model) });
+          committed = true;
+        }
+        const error = freshMessage(model);
+        error.stopReason = "aborted";
+        error.errorMessage = "Request aborted during rate-limit wait.";
+        output.push({ type: "error", reason: "aborted", error });
         output.end();
         return;
       }
-      // "waited" or "skipped" — loop back and retry
+      // waited/skipped -> retry
     }
   })();
 
