@@ -30,7 +30,7 @@ Claude Pro/Max
 
 - sends Claude Code-like OAuth headers
 - rewrites Pi system identity where needed
-- on 429 rate limits errors waits for 30 mintues and retries in a loop
+- on 429/rate-limit errors waits, shows a countdown status line, and retries in a loop
 
 ## License
 

@@ -22,7 +22,12 @@ const PI_REMOVAL_ANCHORS = [
   "badlogic/pi-mono",
 ] as const;
 
-const RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
+const PI_IDENTITY_PATTERNS = [
+  /\bYou are Pi,?\s*/gi,
+  /\bYou are pi,?\s*/g,
+] as const;
+
+const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 
 /** Key used with ctx.ui.setStatus() for the countdown line. */
 const STATUS_KEY = "rate-limit";
@@ -30,32 +35,184 @@ const STATUS_KEY = "rate-limit";
 // ─── Shared UI context ────────────────────────────────────────────────────────
 
 let sharedCtx: ExtensionContext | undefined;
+let restoreFetch: (() => void) | undefined;
+let ambientStatusCleanup: (() => void) | undefined;
+let activeAnthropicSubscriptionRequests = 0;
 
 // ─── Prompt sanitisation ──────────────────────────────────────────────────────
 
 function sanitiseSystemPrompt(raw: string): string {
   const paragraphs = raw.split(/\n\n+/);
-  const filtered = paragraphs.filter((p) => {
-    const lower = p.toLowerCase();
-    if (lower.includes("you are pi")) return false;
-    return !PI_REMOVAL_ANCHORS.some((anchor) => p.includes(anchor));
-  });
+  const filtered = paragraphs.filter((p) =>
+    !PI_REMOVAL_ANCHORS.some((anchor) => p.includes(anchor)),
+  );
+
   return filtered
     .join("\n\n")
-    .replace(/\bpi\b/g, "Claude Code")
-    .replace(/\bPi\b/g, "Claude Code")
+    .split("\n")
+    .map((line) => {
+      let next = line;
+      for (const pattern of PI_IDENTITY_PATTERNS) {
+        next = next.replace(pattern, "");
+      }
+      return next;
+    })
+    .join("\n")
     .trim();
 }
 
-// ─── 429 detection ───────────────────────────────────────────────────────────
-// Match only the HTTP 429 status code — deliberately not matching the phrase
-// "rate limit" so we don't accidentally swallow unrelated errors.
+function isOAuthApiKey(apiKey: string | undefined): boolean {
+  return apiKey?.includes("sk-ant-oat") ?? false;
+}
 
-function is429(msg: string): boolean {
-  return msg.includes("429");
+function isAnthropicSubscriptionModel(ctx: ExtensionContext): boolean {
+  const model = ctx.model;
+  return Boolean(
+    model &&
+    model.provider === "anthropic" &&
+    ctx.modelRegistry.isUsingOAuth(model),
+  );
+}
+
+function isAnthropicSubscriptionRequest(
+  model: Model<Api>,
+  options?: SimpleStreamOptions,
+): boolean {
+  if (model.provider !== "anthropic") return false;
+  if (isOAuthApiKey(options?.apiKey)) return true;
+
+  const activeModel = sharedCtx?.model;
+  return Boolean(
+    activeModel &&
+    activeModel.provider === model.provider &&
+    activeModel.id === model.id &&
+    sharedCtx?.modelRegistry.isUsingOAuth(activeModel),
+  );
+}
+
+// ─── Rate-limit detection ───────────────────────────────────────────────────
+// Anthropic/OAuth rate limit failures do not always stringify as plain
+// "HTTP 429". Depending on where the error is created, Pi may only see the SDK
+// message ("rate_limit_error", "Too Many Requests", "quota exceeded", etc.).
+// Keep this intentionally focused on common rate-limit terms so unrelated 4xx
+// errors still propagate normally.
+
+function isRateLimitError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    /(?:^|\D)429(?:\D|$)/.test(msg) ||
+    lower.includes("rate_limit") ||
+    /rate\s*limit/.test(lower) ||
+    lower.includes("too many requests") ||
+    lower.includes("quota exceeded") ||
+    lower.includes("quota will reset") ||
+    lower.includes("retry delay") ||
+    lower.includes("retry-after")
+  );
+}
+
+function parseRetryDelayMs(msg: string): number | undefined {
+  const retryAfter = msg.match(/retry-after(?:-ms)?[^0-9]*(\d+(?:\.\d+)?)/i);
+  if (retryAfter?.[1]) {
+    const value = Number(retryAfter[1]);
+    if (Number.isFinite(value) && value > 0) {
+      return msg.toLowerCase().includes("retry-after-ms") ? value : value * 1_000;
+    }
+  }
+
+  const requested = msg.match(/requested\s+(\d+(?:\.\d+)?)s\s+retry delay/i);
+  if (requested?.[1]) {
+    const value = Number(requested[1]);
+    if (Number.isFinite(value) && value > 0) return value * 1_000;
+  }
+
+  const retryIn = msg.match(/retry\s+in\s+(\d+(?:\.\d+)?)(ms|s|m|h)/i);
+  if (retryIn?.[1] && retryIn[2]) {
+    const value = Number(retryIn[1]);
+    if (Number.isFinite(value) && value > 0) {
+      const unit = retryIn[2].toLowerCase();
+      if (unit === "ms") return value;
+      if (unit === "s") return value * 1_000;
+      if (unit === "m") return value * 60_000;
+      if (unit === "h") return value * 3_600_000;
+    }
+  }
+
+  const resetAfter = msg.match(/reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/i);
+  if (resetAfter) {
+    const hours = resetAfter[1] ? Number(resetAfter[1]) : 0;
+    const mins = resetAfter[2] ? Number(resetAfter[2]) : 0;
+    const secs = Number(resetAfter[3]);
+    if ([hours, mins, secs].every(Number.isFinite)) {
+      return ((hours * 60 + mins) * 60 + secs) * 1_000;
+    }
+  }
+
+  return undefined;
+}
+
+function rateLimitWaitMs(msg: string): number {
+  return parseRetryDelayMs(msg) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
+}
+
+function retryAfterHeaderMs(headers: Headers): number | undefined {
+  const retryAfterMs = headers.get("retry-after-ms");
+  if (retryAfterMs) {
+    const value = Number(retryAfterMs);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+
+  const retryAfter = headers.get("retry-after");
+  if (!retryAfter) return undefined;
+
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1_000;
+
+  const dateMs = Date.parse(retryAfter);
+  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+
+  return undefined;
 }
 
 // ─── Rate-limit countdown ─────────────────────────────────────────────────────
+
+function statusText(waitMs: number, deadline: number, allowSkip: boolean): string {
+  const remaining = Math.max(0, deadline - Date.now());
+  const totalSecs = Math.ceil(remaining / 1_000);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = (totalSecs % 60).toString().padStart(2, "0");
+  return (
+    `⏳ Rate limited — next retry in ${mins}m ${secs}s` +
+    (allowSkip ? "  (Enter to retry now)" : "")
+  );
+}
+
+function showAmbientRateLimitStatus(waitMs: number): void {
+  const ctx = sharedCtx;
+  if (!ctx) return;
+
+  ambientStatusCleanup?.();
+
+  const deadline = Date.now() + waitMs;
+  const tick = () => {
+    const text = statusText(waitMs, deadline, false);
+    ctx.ui.setStatus(STATUS_KEY, text);
+    ctx.ui.setWorkingMessage(text);
+  };
+
+  tick();
+  const ticker = setInterval(tick, 1_000);
+  ambientStatusCleanup = () => {
+    clearInterval(ticker);
+    ambientStatusCleanup = undefined;
+    ctx.ui.setStatus(STATUS_KEY, undefined);
+    ctx.ui.setWorkingMessage();
+  };
+}
+
+function clearAmbientRateLimitStatus(): void {
+  ambientStatusCleanup?.();
+}
 
 function waitForRateLimit(
   waitMs: number,
@@ -85,13 +242,7 @@ function waitForRateLimit(
     signal?.addEventListener("abort", onAbort);
 
     const tick = () => {
-      const remaining = Math.max(0, deadline - Date.now());
-      const totalSecs = Math.ceil(remaining / 1_000);
-      const mins = Math.floor(totalSecs / 60);
-      const secs = (totalSecs % 60).toString().padStart(2, "0");
-      const text =
-        `⏳ Rate limited — next retry in ${mins}m ${secs}s` +
-        (unsubInput ? "  (Enter to retry now)" : "");
+      const text = statusText(waitMs, deadline, Boolean(unsubInput));
       ctx?.ui.setStatus(STATUS_KEY, text);
       ctx?.ui.setWorkingMessage(text);
     };
@@ -109,11 +260,39 @@ function waitForRateLimit(
       unsubInput?.();
       ctx?.ui.setStatus(STATUS_KEY, undefined);
       ctx?.ui.setWorkingMessage(); // restore default "Working..."
+      clearAmbientRateLimitStatus();
     }
   });
 }
 
-// ─── 429-retrying streamSimple wrapper ───────────────────────────────────────
+// ─── Early 429 observer ──────────────────────────────────────────────────────
+
+function installFetchRateLimitObserver(): void {
+  if (restoreFetch || typeof globalThis.fetch !== "function") return;
+
+  const originalFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+    const response = await originalFetch(...args);
+
+    if (activeAnthropicSubscriptionRequests > 0) {
+      if (response.status === 429) {
+        const waitMs = retryAfterHeaderMs(response.headers) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
+        showAmbientRateLimitStatus(waitMs);
+      } else if (ambientStatusCleanup && response.ok) {
+        clearAmbientRateLimitStatus();
+      }
+    }
+
+    return response;
+  }) as typeof fetch;
+
+  restoreFetch = () => {
+    globalThis.fetch = originalFetch as typeof fetch;
+    restoreFetch = undefined;
+  };
+}
+
+// ─── Rate-limit-retrying streamSimple wrapper ────────────────────────────────
 
 type StreamSimpleFn = (
   model: Model<Api>,
@@ -138,11 +317,12 @@ function freshMessage(model: Model<Api>): AssistantMessage {
 }
 
 /**
- * Wrap a streamSimple with an indefinite 429 retry loop.
+ * Wrap a streamSimple with an indefinite rate-limit retry loop.
  *
  * Important: we forward the built-in provider's events unchanged once an
- * attempt is known to be non-429. That preserves tool-call streaming exactly.
- * Potential 429 attempts are buffered and discarded, so Pi never sees them.
+ * attempt is known to be non-rate-limited. That preserves tool-call streaming
+ * exactly. Potential rate-limited attempts are buffered and discarded, so Pi
+ * never sees them.
  */
 function streamWithRateLimitRetry(
   delegate: StreamSimpleFn,
@@ -161,72 +341,80 @@ function streamWithRateLimitRetry(
     };
 
     while (true) {
-      const inner = delegate(model, context, options);
+      activeAnthropicSubscriptionRequests++;
       const buffer: AssistantMessageEvent[] = [];
-      let got429 = false;
+      let gotRateLimit = false;
+      let waitMs = DEFAULT_RATE_LIMIT_WAIT_MS;
 
       try {
-        for await (const event of inner) {
-          if (!committed) {
-            if (event.type === "error") {
-              const errMsg = event.error.errorMessage ?? "";
-              if (is429(errMsg) && !options?.signal?.aborted) {
-                got429 = true;
-                break;
+        try {
+          const inner = delegate(model, context, options);
+          for await (const event of inner) {
+            if (!committed) {
+              if (event.type === "error") {
+                const errMsg = event.error.errorMessage ?? "";
+                if (isRateLimitError(errMsg) && !options?.signal?.aborted) {
+                  gotRateLimit = true;
+                  waitMs = rateLimitWaitMs(errMsg);
+                  break;
+                }
+                // Non-rate-limit error: flush buffered start (if any), then forward error.
+                flush(buffer);
+                output.push(event);
+                output.end();
+                return;
               }
-              // Non-429 error: flush buffered start (if any), then forward error.
+
+              if (event.type === "start") {
+                buffer.push(event);
+                continue;
+              }
+
+              // First non-start, non-error event means this attempt is real.
               flush(buffer);
               output.push(event);
-              output.end();
-              return;
-            }
-
-            if (event.type === "start") {
-              buffer.push(event);
+              if (event.type === "done") {
+                output.end();
+                return;
+              }
               continue;
             }
 
-            // First non-start, non-error event means this attempt is real.
-            flush(buffer);
+            // Once committed, forward everything unchanged.
             output.push(event);
-            if (event.type === "done") {
+            if (event.type === "done" || event.type === "error") {
               output.end();
               return;
             }
-            continue;
           }
-
-          // Once committed, forward everything unchanged.
-          output.push(event);
-          if (event.type === "done" || event.type === "error") {
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          if (isRateLimitError(errMsg) && !options?.signal?.aborted) {
+            gotRateLimit = true;
+            waitMs = rateLimitWaitMs(errMsg);
+          } else {
+            if (!committed) {
+              // Synthetic start+error so the stream protocol stays valid.
+              output.push({ type: "start", partial: freshMessage(model) });
+              committed = true;
+            }
+            const error = freshMessage(model);
+            error.stopReason = options?.signal?.aborted ? "aborted" : "error";
+            error.errorMessage = errMsg;
+            output.push({
+              type: "error",
+              reason: error.stopReason as "error" | "aborted",
+              error,
+            });
             output.end();
             return;
           }
         }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (is429(errMsg) && !options?.signal?.aborted) {
-          got429 = true;
-        } else {
-          if (!committed) {
-            // Synthetic start+error so the stream protocol stays valid.
-            output.push({ type: "start", partial: freshMessage(model) });
-            committed = true;
-          }
-          const error = freshMessage(model);
-          error.stopReason = options?.signal?.aborted ? "aborted" : "error";
-          error.errorMessage = errMsg;
-          output.push({
-            type: "error",
-            reason: error.stopReason as "error" | "aborted",
-            error,
-          });
-          output.end();
-          return;
-        }
+      } finally {
+        activeAnthropicSubscriptionRequests--;
       }
 
-      if (!got429) {
+      if (!gotRateLimit) {
         // If a successful attempt ended with only start+done, flush buffered events.
         if (!committed && buffer.length > 0) {
           flush(buffer);
@@ -235,7 +423,7 @@ function streamWithRateLimitRetry(
         return;
       }
 
-      const waitResult = await waitForRateLimit(RATE_LIMIT_WAIT_MS, options?.signal);
+      const waitResult = await waitForRateLimit(waitMs, options?.signal);
       if (waitResult === "aborted") {
         if (!committed) {
           output.push({ type: "start", partial: freshMessage(model) });
@@ -258,8 +446,12 @@ function streamWithRateLimitRetry(
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  installFetchRateLimitObserver();
+
   pi.on("before_agent_start", (event, ctx) => {
     sharedCtx = ctx;
+    if (!isAnthropicSubscriptionModel(ctx)) return;
+
     const sanitised = sanitiseSystemPrompt(event.systemPrompt);
     const withIdentity = sanitised
       ? `${CLAUDE_CODE_IDENTITY}\n\n${sanitised}`
@@ -274,7 +466,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerProvider("anthropic", {
     api: "anthropic-messages",
-    streamSimple: (model, context, options) =>
-      streamWithRateLimitRetry(builtinStreamSimple, model, context, options),
+    streamSimple: (model, context, options) => {
+      if (!isAnthropicSubscriptionRequest(model, options)) {
+        return builtinStreamSimple(model, context, options);
+      }
+      return streamWithRateLimitRetry(builtinStreamSimple, model, context, options);
+    },
   });
 }
