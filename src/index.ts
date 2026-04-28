@@ -22,10 +22,8 @@ const PI_REMOVAL_ANCHORS = [
   "badlogic/pi-mono",
 ] as const;
 
-const PI_IDENTITY_PATTERNS = [
-  /\bYou are Pi,?\s*/gi,
-  /\bYou are pi,?\s*/g,
-] as const;
+const PI_IDENTITY_SENTENCE_PATTERN =
+  /(?:^|\n)\s*You are pi\b[^.!?\n]*(?:[.!?](?=\s|$)|(?=\n|$))/gi;
 
 const DEFAULT_RATE_LIMIT_WAIT_MS = 30 * 60 * 1_000; // 30 minutes
 
@@ -38,10 +36,11 @@ let sharedCtx: ExtensionContext | undefined;
 let restoreFetch: (() => void) | undefined;
 let ambientStatusCleanup: (() => void) | undefined;
 let activeAnthropicSubscriptionRequests = 0;
+const oauthAnthropicModelIds = new Set<string>();
 
 // ─── Prompt sanitisation ──────────────────────────────────────────────────────
 
-function sanitiseSystemPrompt(raw: string): string {
+export function sanitiseSystemPrompt(raw: string): string {
   const paragraphs = raw.split(/\n\n+/);
   const filtered = paragraphs.filter((p) =>
     !PI_REMOVAL_ANCHORS.some((anchor) => p.includes(anchor)),
@@ -49,15 +48,8 @@ function sanitiseSystemPrompt(raw: string): string {
 
   return filtered
     .join("\n\n")
-    .split("\n")
-    .map((line) => {
-      let next = line;
-      for (const pattern of PI_IDENTITY_PATTERNS) {
-        next = next.replace(pattern, "");
-      }
-      return next;
-    })
-    .join("\n")
+    .replace(PI_IDENTITY_SENTENCE_PATTERN, "")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
@@ -79,15 +71,8 @@ function isAnthropicSubscriptionRequest(
   options?: SimpleStreamOptions,
 ): boolean {
   if (model.provider !== "anthropic") return false;
-  if (isOAuthApiKey(options?.apiKey)) return true;
-
-  const activeModel = sharedCtx?.model;
-  return Boolean(
-    activeModel &&
-    activeModel.provider === model.provider &&
-    activeModel.id === model.id &&
-    sharedCtx?.modelRegistry.isUsingOAuth(activeModel),
-  );
+  if (options?.apiKey) return isOAuthApiKey(options.apiKey);
+  return oauthAnthropicModelIds.has(model.id);
 }
 
 // ─── Rate-limit detection ───────────────────────────────────────────────────
@@ -97,7 +82,7 @@ function isAnthropicSubscriptionRequest(
 // Keep this intentionally focused on common rate-limit terms so unrelated 4xx
 // errors still propagate normally.
 
-function isRateLimitError(msg: string): boolean {
+export function isRateLimitError(msg: string): boolean {
   const lower = msg.toLowerCase();
   return (
     /(?:^|\D)429(?:\D|$)/.test(msg) ||
@@ -111,7 +96,7 @@ function isRateLimitError(msg: string): boolean {
   );
 }
 
-function parseRetryDelayMs(msg: string): number | undefined {
+export function parseRetryDelayMs(msg: string): number | undefined {
   const retryAfter = msg.match(/retry-after(?:-ms)?[^0-9]*(\d+(?:\.\d+)?)/i);
   if (retryAfter?.[1]) {
     const value = Number(retryAfter[1]);
@@ -151,11 +136,11 @@ function parseRetryDelayMs(msg: string): number | undefined {
   return undefined;
 }
 
-function rateLimitWaitMs(msg: string): number {
+export function rateLimitWaitMs(msg: string): number {
   return parseRetryDelayMs(msg) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
 }
 
-function retryAfterHeaderMs(headers: Headers): number | undefined {
+export function retryAfterHeaderMs(headers: Headers): number | undefined {
   const retryAfterMs = headers.get("retry-after-ms");
   if (retryAfterMs) {
     const value = Number(retryAfterMs);
@@ -193,8 +178,14 @@ function showAmbientRateLimitStatus(waitMs: number): void {
 
   ambientStatusCleanup?.();
 
+  if (waitMs <= 0) return;
+
   const deadline = Date.now() + waitMs;
   const tick = () => {
+    if (Date.now() >= deadline) {
+      ambientStatusCleanup?.();
+      return;
+    }
     const text = statusText(waitMs, deadline, false);
     ctx.ui.setStatus(STATUS_KEY, text);
     ctx.ui.setWorkingMessage(text);
@@ -214,10 +205,12 @@ function clearAmbientRateLimitStatus(): void {
   ambientStatusCleanup?.();
 }
 
-function waitForRateLimit(
+export function waitForRateLimit(
   waitMs: number,
   signal?: AbortSignal,
 ): Promise<"waited" | "skipped" | "aborted"> {
+  if (waitMs <= 0) return Promise.resolve(signal?.aborted ? "aborted" : "waited");
+
   return new Promise((resolve) => {
     if (signal?.aborted) { resolve("aborted"); return; }
 
@@ -267,6 +260,21 @@ function waitForRateLimit(
 
 // ─── Early 429 observer ──────────────────────────────────────────────────────
 
+function isAnthropicFetch(args: Parameters<typeof fetch>): boolean {
+  const input = args[0];
+  const url =
+    typeof input === "string" ? input :
+    input instanceof URL ? input.href :
+    input.url;
+
+  try {
+    const host = new URL(url).host.toLowerCase();
+    return host === "api.anthropic.com" || host.endsWith(".anthropic.com");
+  } catch {
+    return false;
+  }
+}
+
 function installFetchRateLimitObserver(): void {
   if (restoreFetch || typeof globalThis.fetch !== "function") return;
 
@@ -274,7 +282,7 @@ function installFetchRateLimitObserver(): void {
   globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
     const response = await originalFetch(...args);
 
-    if (activeAnthropicSubscriptionRequests > 0) {
+    if (activeAnthropicSubscriptionRequests > 0 && isAnthropicFetch(args)) {
       if (response.status === 429) {
         const waitMs = retryAfterHeaderMs(response.headers) ?? DEFAULT_RATE_LIMIT_WAIT_MS;
         showAmbientRateLimitStatus(waitMs);
@@ -324,7 +332,7 @@ function freshMessage(model: Model<Api>): AssistantMessage {
  * exactly. Potential rate-limited attempts are buffered and discarded, so Pi
  * never sees them.
  */
-function streamWithRateLimitRetry(
+export function streamWithRateLimitRetry(
   delegate: StreamSimpleFn,
   model: Model<Api>,
   context: Context,
@@ -342,6 +350,7 @@ function streamWithRateLimitRetry(
 
     while (true) {
       activeAnthropicSubscriptionRequests++;
+      installFetchRateLimitObserver();
       const buffer: AssistantMessageEvent[] = [];
       let gotRateLimit = false;
       let waitMs = DEFAULT_RATE_LIMIT_WAIT_MS;
@@ -358,8 +367,13 @@ function streamWithRateLimitRetry(
                   waitMs = rateLimitWaitMs(errMsg);
                   break;
                 }
-                // Non-rate-limit error: flush buffered start (if any), then forward error.
-                flush(buffer);
+                // Non-rate-limit error: ensure start came first, then forward error.
+                if (buffer.length > 0) {
+                  flush(buffer);
+                } else {
+                  output.push({ type: "start", partial: freshMessage(model) });
+                  committed = true;
+                }
                 output.push(event);
                 output.end();
                 return;
@@ -371,7 +385,12 @@ function streamWithRateLimitRetry(
               }
 
               // First non-start, non-error event means this attempt is real.
-              flush(buffer);
+              if (buffer.length > 0) {
+                flush(buffer);
+              } else {
+                output.push({ type: "start", partial: freshMessage(model) });
+                committed = true;
+              }
               output.push(event);
               if (event.type === "done") {
                 output.end();
@@ -412,13 +431,25 @@ function streamWithRateLimitRetry(
         }
       } finally {
         activeAnthropicSubscriptionRequests--;
+        if (activeAnthropicSubscriptionRequests === 0) {
+          clearAmbientRateLimitStatus();
+          restoreFetch?.();
+        }
       }
 
       if (!gotRateLimit) {
-        // If a successful attempt ended with only start+done, flush buffered events.
-        if (!committed && buffer.length > 0) {
-          flush(buffer);
+        if (!committed) {
+          if (buffer.length > 0) {
+            flush(buffer);
+          } else {
+            output.push({ type: "start", partial: freshMessage(model) });
+            committed = true;
+          }
         }
+        const error = freshMessage(model);
+        error.stopReason = "error";
+        error.errorMessage = "Provider stream ended without a terminal event.";
+        output.push({ type: "error", reason: "error", error });
         output.end();
         return;
       }
@@ -446,11 +477,10 @@ function streamWithRateLimitRetry(
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  installFetchRateLimitObserver();
-
   pi.on("before_agent_start", (event, ctx) => {
     sharedCtx = ctx;
     if (!isAnthropicSubscriptionModel(ctx)) return;
+    if (ctx.model) oauthAnthropicModelIds.add(ctx.model.id);
 
     const sanitised = sanitiseSystemPrompt(event.systemPrompt);
     const withIdentity = sanitised
